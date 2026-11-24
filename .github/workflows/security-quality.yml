@@ -1,0 +1,172 @@
+name: Security and quality
+
+# Inspected source snapshots:
+# Recipeak 9972075080ad810aedf479bc8572af2c2cefa901:
+#   security-checks.yml (actionlint, zizmor, Gitleaks, dependency review),
+#   assurance.yml (aggregate gate), app-checks.yml (future tests/type/lint),
+#   native-checks.yml and release-sbom.yml (deferred until applicable).
+# Votic 7f060d2e25c1b5822c4652148d96eeed28ced72a:
+#   security-checks.yml (same baseline; future Knip/Semgrep/OSV/npm audit),
+#   assurance.yml, reliability-edge-cases.yml, browser-checks.yml
+#   (future coverage, complexity, component and browser tests).
+# All paths above are under .github/workflows/.
+#
+# Current scope: README + CI configuration; no application stack exists.
+# DEFERRED, NOT PASSED: application SAST/CodeQL/Semgrep, dead code/unused
+# dependencies (e.g. Knip), package vulnerability/license audits (OSV/native
+# package tools), formatting/type checks, unit/integration/security/browser
+# tests and coverage thresholds, native builds, IaC/container scans and SBOM.
+# Add real commands, lockfiles, thresholds and fixtures when choosing a stack.
+# Security tests should cover tenant isolation, authorization, SSRF/redirects,
+# malicious uploads, prompt injection, privacy/retention and rate limiting.
+# Recipe/allergen data, playback/widgets, release signing, deployments and
+# bot-specific review-comment automation are intentionally not applicable.
+# No auto-fixes, repository writes, PR comments, caches or secret artifacts.
+# Branch protection must separately require "Required security and quality".
+# Versioned PyPI tools have unpinned transitive dependencies; review updates.
+# Gitleaks archive digest verified against upstream release asset metadata.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 11 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  workflow-lint:
+    name: YAML and workflow security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate YAML syntax and duplicate keys
+        run: >-
+          pipx run --spec yamllint==1.37.1 yamllint
+          -d '{extends: default, rules: {line-length: disable, truthy: disable, document-start: disable}}'
+          .github
+      - name: Validate Actions expressions and embedded shell
+        run: pipx run --spec actionlint-py==1.7.12.25 actionlint -color
+      - name: Audit workflow security without repository credentials
+        run: pipx run zizmor==1.32.0 --offline --format plain .github/workflows
+
+  secrets:
+    name: Full fetched history and working tree secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install checksum-verified Gitleaks CLI
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" version
+      - name: Require nonempty history and scan every fetched ref
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          test "$(git rev-list --all --count)" -gt 0
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" git --log-opts="--all" --redact --no-banner
+      - name: Scan checked-out files including merge result
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/gitleaks-bin/gitleaks" dir . --redact --no-banner
+
+  dependency-review:
+    name: PR dependency vulnerability review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Public repository supports dependency review. No application packages
+      # currently exist; this reviews graph-supported changes including Actions.
+      # Fails on moderate or higher vulnerabilities; no fabricated license list.
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: never
+
+  scope:
+    name: Report deferred checks and guard stack introduction
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report actual coverage and require CI onboarding for code
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          from pathlib import PurePosixPath
+          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          # Conservative documentation-only baseline. Unknown files require
+          # deliberate CI expansion rather than silently passing untested code.
+          def documented(path):
+              p = PurePosixPath(path)
+              return (p.suffix.lower() in {".md", ".rst"}
+                      or (path.startswith(".github/") and p.suffix in {".yml", ".yaml"})
+                      or path in {".gitignore", ".gitattributes", "LICENSE", "CODEOWNERS"})
+          pending = [p for p in files if p and not documented(p)]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("## Coverage scope\n\n")
+              summary.write("Active: YAML/actionlint/zizmor; Gitleaks fetched history and files; PR dependency review.\n\n")
+              summary.write("DEFERRED (not tested): application bugs/SAST, dead code, package audits/licenses, ")
+              summary.write("unit/integration/security tests, coverage, builds, IaC and SBOM. No stack is configured.\n")
+              if pending:
+                  summary.write("\nNew non-documentation files require stack-specific CI onboarding.\n")
+          if pending:
+              print("::error::Add appropriate stack-specific security, dependency, dead-code and test jobs before accepting application/configuration files.")
+              raise SystemExit(1)
+          PY
+
+  required:
+    name: Required security and quality
+    if: ${{ always() }}
+    needs: [workflow-lint, secrets, dependency-review, scope]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      LINT: ${{ needs.workflow-lint.result }}
+      SECRETS_SCAN: ${{ needs.secrets.result }}
+      DEPENDENCIES: ${{ needs.dependency-review.result }}
+      SCOPE: ${{ needs.scope.result }}
+      EVENT: ${{ github.event_name }}
+    steps:
+      - name: Enforce applicable checks without masking failures
+        run: |
+          set -euo pipefail
+          test "$LINT" = success
+          test "$SECRETS_SCAN" = success
+          test "$SCOPE" = success
+          if [ "$EVENT" = pull_request ]; then
+            test "$DEPENDENCIES" = success
+          else
+            test "$DEPENDENCIES" = skipped
+          fi
+          echo "Baseline checks passed. Application checks remain explicitly deferred." >> "$GITHUB_STEP_SUMMARY"
